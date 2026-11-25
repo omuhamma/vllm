@@ -1,0 +1,2130 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Adapted from flash-linear-attention: Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+
+"""
+Two-kernel fused KDA forward, following the FlashKDA kernel split.
+
+The default ``chunk_delta_attn_fwd`` pipeline runs five kernels (l2norm, beta
+sigmoid, gate cumsum, intra, delta_h, gla_o) and materializes ``g_cumsum``,
+``Aqk``, ``Akk``, ``w``, ``u`` and ``h`` in HBM between them. This path collapses
+the same math into two:
+
+  K1 (``_flash_kda_prepare_kernel``), token-parallel over chunks:
+      q/k L2 norm, gate activation + chunk cumsum, beta sigmoid, the decayed
+      q/k tiles, the per-chunk gate total, ``Mqk``, and the triangular inverse
+      ``(I - L)^-1``. Everything lands in a per-chunk workspace.
+
+  K2 (``_flash_kda_segment_kernel``), sequential over chunks within one
+      segment: the delta-rule recurrence and the output projection, reading
+      only the K1 workspace plus ``v``/``beta``.
+
+The recurrent state stays in registers across the whole segment in K2, which is
+the point of the split: the baseline writes ``h`` for every chunk to HBM and
+reads it back in the output kernel.
+
+A segment defaults to the whole sequence. When that leaves the device idle --
+K2's block count is only ``n_segments * H * (V / BW)``, so a 12-head model gets
+96 blocks against 256 CUs -- the sequence is instead cut into fixed-length
+segments that run concurrently. Each segment's state update is affine in its
+incoming state, ``h' = A_seg h + b_seg``, and both parts are produced by this
+same kernel: seeding it with ``h = 0`` gives ``b_seg``, and seeding it with
+``h = I`` and ``v = 0`` propagates a basis whose result is ``A_seg``, avoiding
+any explicit per-chunk operator product. A short scan (``n_segments`` steps
+instead of ``n_chunks``) then recovers each segment's true incoming state, and a
+final pass re-runs the segments to write outputs.
+
+Restrictions (the caller is expected to check these and fall back):
+    * ``K == V == 128`` and ``HV == H`` (no GVA).
+    * ``chunk_size == 32`` (see ``FLASH_KDA_CHUNK``).
+    * The fused-gate sigmoid path only, i.e. ``use_gate_in_kernel`` with
+      ``lower_bound`` set, plus in-kernel qk l2norm and beta sigmoid.
+    * ``safe_gate``. K1 bounds the intra-chunk decay with a midpoint pivot
+      rather than the sub-chunk pivot ``safe_gate`` selects in the default
+      intra kernel, so it answers that request by a different route and has no
+      unpivoted mode to offer a caller who declined it.
+    * Forward only, and no intermediates for a backward pass.
+    * Paged ``state_cache`` is FlashKDA-only, V-first, and is not packed:
+      each slot is dense ``[H, V, K]`` while ``stride(0)`` may be padded.
+"""
+
+import ctypes
+import functools
+import itertools
+import math
+import os
+
+import torch
+import triton
+import triton.language as tl
+
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
+    CHUNK_DELTA_ATTN_TRITON_AUTOTUNE,
+    autotune_cache_kwargs,
+    chunk_delta_attn_tuned_config,
+    chunk_delta_attn_tuned_config_shortlist,
+    exp,
+    exp2,
+    input_guard,
+    tensor_cache,
+)
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
+    prepare_chunk_indices,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
+
+_LOGGER = AiterTritonLogger()
+
+# On by default. `flash_kda_supported` decides per call and anything outside the
+# restrictions above keeps the default pipeline, so this switch only exists to
+# force that pipeline anyway -- to A/B the two, or to back out if the fused path
+# regresses on a shape the admission check still accepts.
+AITER_FDA_ENABLE: bool = os.getenv("AITER_FDA_ENABLE", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+_GLUON_SEL: str = os.getenv("AITER_FDA_USE_GLUON", "1").lower()
+_GLUON_BOTH: bool = _GLUON_SEL in ("1", "true", "yes", "on", "all")
+AITER_FDA_USE_GLUON_K1: bool = _GLUON_BOTH or _GLUON_SEL == "k1"
+AITER_FDA_USE_GLUON_K2: bool = _GLUON_BOTH or _GLUON_SEL == "k2"
+# Leave small unsegmented shapes to the Triton pass C (see _k2c_gluon_usable).
+# Tests clear it to pin pass C to Gluon.
+_K2C_ROUTE_BY_SIZE: bool = True
+
+# Pass B as _flash_kda_seg_scan_prefetch_kernel, on the arch it was measured on;
+# elsewhere _flash_kda_seg_scan_kernel keeps its tuning. Off to A/B the two.
+AITER_FDA_SCAN_PREFETCH: bool = os.getenv("AITER_FDA_SCAN_PREFETCH", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+DEVICE_ARCH = arch_info.get_arch()
+_GLUON_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250")
+_GLUON_K2C_ARCH_OK: bool = DEVICE_ARCH in ("gfx950", "gfx1250")
+_SCAN_PREFETCH: bool = AITER_FDA_SCAN_PREFETCH and DEVICE_ARCH == "gfx1250"
+
+_LOGGED_ROUTES: set = set()
+
+# The K-dimension is consumed as two 64-wide halves so the recurrent state fits
+# a pair of [64, BW] register tiles in K2. Relaxing this means reworking K2's
+# state blocking, not just the loop bound.
+FLASH_KDA_K: int = 128
+# C = 32, not 64. The intra-chunk decay factors are re-centered on the chunk
+# midpoint, which keeps them in fp32 for a span of about +-70 log2 units; the
+# Kimi gate spends roughly 3.6 of those per token, so 32 rows fit and 64 do not.
+# See the pivot comment in the prepare kernel.
+FLASH_KDA_CHUNK: int = 32
+
+# Width of the diagonal blocks the WY inverse is built from. The Neumann powers
+# used to invert them grow with the block width, so this bounds how far the
+# intermediates can run ahead of the O(1) result; 16 is also what the fla and
+# CUTLASS kernels use.
+FLASH_KDA_INV_BLOCK: int = 16
+
+_K1_FALLBACK_CONFIG = triton.Config({}, num_warps=2, num_stages=1)
+
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "HAS_BIAS": lambda args: args["dt_bias"] is not None,
+        "STORE_BETA": lambda args: args["ws_beta"] is not None,
+    }
+)
+@triton.autotune(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
+        [
+            triton.Config({}, num_warps=nw, num_stages=ns)
+            for nw in [2, 4]
+            for ns in [1, 2]
+        ],
+        default_config=chunk_delta_attn_tuned_config(
+            "flash_kda_prepare_kernel", _K1_FALLBACK_CONFIG
+        ),
+    ),
+    key=["H", "K", "C"],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=["T"])
+def _flash_kda_prepare_kernel(
+    q,
+    k,
+    g_raw,
+    beta_raw,
+    A_log,
+    dt_bias,
+    ws_kd,
+    ws_qd,
+    ws_kr,
+    ws_gt,
+    ws_inv_mqk,
+    ws_beta,
+    cu_seqlens,
+    chunk_indices,
+    scale,
+    lower_bound,
+    T,
+    NT,
+    TOTAL_TILES,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    C: tl.constexpr,
+    BC: tl.constexpr,
+    NUM_DOUBLING: tl.constexpr,
+    NUM_MERGE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    CM_QKG: tl.constexpr = "",
+    CM_WS: tl.constexpr = "",
+    STORE_BETA: tl.constexpr = False,
+):
+    """Per-chunk prepare: decayed q/k, gate total, Mqk, and (I - L)^-1."""
+    i_t = tl.program_id(0).to(tl.int64)
+    i_bh = tl.program_id(1).to(tl.int64)
+    i_b, i_h = i_bh // H, i_bh % H
+
+    if IS_VARLEN:
+        # program_id(0) is already the global chunk index; chunk_indices maps it
+        # to (sequence, chunk-within-sequence).
+        i_n = tl.load(chunk_indices + i_t * 2).to(tl.int64)
+        i_tl = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T_seq = eos - bos
+        g_tile = i_t
+    else:
+        i_tl = i_t
+        bos = i_b * T
+        T_seq = T
+        g_tile = i_b * NT + i_t
+
+    t_off = i_tl * C
+    if t_off >= T_seq:
+        return
+    actual_len = tl.minimum(C, T_seq - t_off)
+
+    o_c = tl.arange(0, C)
+    o_k = tl.arange(0, K)
+    m_c = o_c < actual_len
+    m_ck = m_c[:, None]
+
+    base = (bos + t_off) * H + i_h
+    qk_off = base * K + o_c[:, None] * (H * K) + o_k[None, :]
+
+    b_q = tl.load(q + qk_off, mask=m_ck, other=0.0, cache_modifier=CM_QKG).to(
+        tl.float32
+    )
+    b_k = tl.load(k + qk_off, mask=m_ck, other=0.0, cache_modifier=CM_QKG).to(
+        tl.float32
+    )
+
+    # L2 normalize rows, matching l2norm_fwd's eps placement.
+    b_q = b_q * (1.0 / tl.sqrt(tl.sum(b_q * b_q, axis=1) + 1e-6))[:, None]
+    b_k = b_k * (1.0 / tl.sqrt(tl.sum(b_k * b_k, axis=1) + 1e-6))[:, None]
+
+    # Gate: lower_bound * sigmoid(exp(A_log) * (g + dt_bias)), then chunk-local
+    # cumsum into log2 space. Same expression as chunk_gate_cumsum so the two
+    # paths agree bit-for-bit on the gate.
+    b_g = tl.load(g_raw + qk_off, mask=m_ck, other=0.0, cache_modifier=CM_QKG).to(
+        tl.float32
+    )
+    if HAS_BIAS:
+        b_g = b_g + tl.load(dt_bias + i_h * K + o_k).to(tl.float32)[None, :]
+    b_A = tl.load(A_log + i_h).to(tl.float32)
+    b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_g)
+    LOG2_E: tl.constexpr = 1.4426950408889634
+    b_gcum = tl.cumsum(b_gate, axis=0) * LOG2_E
+    b_gcum = tl.where(m_ck, b_gcum, 0.0)
+
+    # gcum is non-positive and monotonically decreasing down the chunk, so every
+    # exponent below is <= 0 and exp2 cannot overflow. gcum itself reaches about
+    # -460 at C=64 with lower_bound=-5, which is why nothing here forms
+    # exp2(-gcum) unclamped.
+    last_row = actual_len - 1
+    b_g_last = tl.sum(tl.where(o_c[:, None] == last_row, b_gcum, 0.0), axis=0)
+    b_g_total = exp2(b_g_last)
+
+    # Decay measured from the chunk start. These only ever multiply the recurrent
+    # state, which enters the chunk at row 0, so a row whose gate has decayed past
+    # fp32 range genuinely contributes nothing and flushing it to zero is correct.
+    b_exp_g = exp2(b_gcum)
+
+    # Stored here rather than at the end of the kernel: these are three C x K
+    # tiles, and holding them live across the inversion below costs more
+    # registers than K1 has to spare. At H = 64 that alone decided whether the
+    # kernel fit in 256 VGPRs, i.e. whether it ran at one or two waves per SIMD.
+    #
+    # Workspace is [H, TOTAL_TILES, ...] so one sequence's chunks stay contiguous
+    # for K2's sequential walk. Tail rows are zeroed rather than left unwritten:
+    # K2 accumulates k_restored^T @ U over all C rows, so garbage there would
+    # corrupt the recurrent state, not just the masked output rows.
+    ws_idx = i_h * TOTAL_TILES + g_tile
+    ck_off = ws_idx * C * K + o_c[:, None] * K + o_k[None, :]
+    tl.store(
+        ws_kd + ck_off,
+        tl.where(m_ck, b_k * b_exp_g, 0.0).to(tl.bfloat16),
+        cache_modifier=CM_WS,
+    )
+    tl.store(
+        ws_qd + ck_off,
+        tl.where(m_ck, b_q * b_exp_g * scale, 0.0).to(tl.bfloat16),
+        cache_modifier=CM_WS,
+    )
+    tl.store(
+        ws_kr + ck_off,
+        tl.where(m_ck, b_k * exp2(b_g_last[None, :] - b_gcum), 0.0).to(tl.bfloat16),
+        cache_modifier=CM_WS,
+    )
+    tl.store(ws_gt + ws_idx * K + o_k, b_g_total, cache_modifier=CM_WS)
+
+    p_beta = beta_raw + (bos + t_off) * H + i_h + o_c * H
+    b_beta = tl.sigmoid(tl.load(p_beta, mask=m_c, other=0.0).to(tl.float32))
+    # For the Gluon K2.
+    if STORE_BETA:
+        tl.store(ws_beta + ws_idx * C + o_c, b_beta, cache_modifier=CM_WS)
+
+    # The intra-chunk matrices need decay *differences* between two rows of the
+    # same chunk. Those are O(1) near the diagonal even when each row's decay from
+    # the chunk start is not, so they cannot be factored as
+    # exp2(gcum[i]) * exp2(-gcum[j]): with the Kimi gate the cumsum drops about
+    # 3.6 log2 units per token, so one factor underflows while the other overflows
+    # and the product that should have been O(1) collapses. Re-centering on the
+    # chunk midpoint halves the span each factor has to cover, which keeps both
+    # inside fp32 for C <= 32. C = 64 spans ~280 log2 units and needs a per
+    # sub-chunk pivot instead, as the default intra kernel uses.
+    o_mid = tl.minimum(C // 2, actual_len - 1)
+    b_gp = tl.sum(tl.where(o_c[:, None] == o_mid, b_gcum, 0.0), axis=0)
+    b_gm = b_gcum - b_gp[None, :]
+    b_dec = exp2(b_gm)
+    b_inc = exp2(-b_gm)
+    b_k_piv = tl.where(m_ck, b_k * b_dec, 0.0).to(tl.bfloat16)
+    b_q_piv = tl.where(m_ck, b_q * b_dec * scale, 0.0).to(tl.bfloat16)
+    b_k_inv = tl.where(m_ck, b_k * b_inc, 0.0).to(tl.bfloat16)
+
+    # The WY form needs (I + tril(diag(beta) K K^T, -1))^-1. L is negated here so
+    # the doubling below can be written as the plain Neumann series in L; folding
+    # the sign in anywhere later would need alternating signs per term.
+    # Getting this wrong is nearly invisible at the Kimi default lower_bound=-5:
+    # the decay damps L to almost nothing, so (I + L)^-1 and (I - L)^-1 agree to
+    # well inside bf16. It only shows up as the gate weakens, which is what the
+    # lower_bound sweep in the tests is guarding.
+    o_i = tl.arange(0, C)
+    b_L = tl.dot(b_k_piv, tl.trans(b_k_inv))
+    b_L = tl.where(o_i[:, None] > o_i[None, :], -b_L * b_beta[:, None], 0.0)
+
+    cc_off = ws_idx * 2 * C * C + o_i[:, None] * C + o_i[None, :]
+    b_Mqk = tl.dot(b_q_piv, tl.trans(b_k_inv))
+    b_Mqk = tl.where(o_i[:, None] >= o_i[None, :], b_Mqk, 0.0)
+    tl.store(ws_inv_mqk + cc_off + C * C, b_Mqk, cache_modifier=CM_WS)
+
+    # Invert the BC-wide diagonal blocks via (I+D)(I+D^2)(I+D^4)...(I+D^(BC/2)),
+    # then fold the sub-diagonal blocks back in, doubling the block width each
+    # round. D is strictly lower triangular, hence nilpotent, and so is
+    # INV @ L_off at every merge level (it maps one sub-block into the one below
+    # and no further), so both halves are exact in exact arithmetic.
+    # Summing I + D + D^2 + D^4 + ... instead would silently drop D^3, D^5, D^6,
+    # and every other non-power-of-two term; that is not the inverse, and on this
+    # D it is off by the magnitude of the matrix itself.
+    #
+    # The block split is not about the answer but about the intermediates. L^k
+    # counts paths down the chunk, so across all C = 32 rows its entries reach
+    # 5e7 once the keys correlate and the gate stops damping L, while the inverse
+    # they sum to stays bounded by 1. Nothing survives that cancellation: the
+    # flat doubling comes out 400% wrong even in fp32, 1e5 wrong in bf16, and
+    # overflows fp16. Confined to BC = 16 rows the same powers peak at 2e3 and
+    # the result lands within 2e-4, at an identical matmul count.
+    #
+    # input_precision is spelled out because an unannotated fp32 dot is not fp32
+    # everywhere: tl.dot resolves it to "tf32" on any target that allows it, and
+    # gfx942 then selects v_mfma_f32_32x32x4_xf32, which truncates to 19 bits
+    # without rounding. On a doubling this cancellation-prone that is 2e1 off.
+    b_D = tl.where(o_i[:, None] // BC == o_i[None, :] // BC, b_L, 0.0)
+    b_INV = tl.where(o_i[:, None] == o_i[None, :], 1.0, 0.0) + b_D
+    b_Dp = tl.dot(b_D, b_D, input_precision="ieee")
+    for _ in tl.static_range(NUM_DOUBLING):
+        b_INV = b_INV + tl.dot(b_INV, b_Dp, input_precision="ieee")
+        b_Dp = tl.dot(b_Dp, b_Dp, input_precision="ieee")
+
+    # fp32 throughout: the partial sums here are what the split keeps small, and
+    # narrowing the matmuls to fp16 puts the ill-conditioned case back at 100%
+    # error. This is the parallel kernel, so the width is nearly free; only the
+    # fp16 store below is seen by K2's serial walk.
+    w = BC
+    for _ in tl.static_range(NUM_MERGE):
+        m_off = (o_i[:, None] // (2 * w) == o_i[None, :] // (2 * w)) & (
+            o_i[:, None] // w != o_i[None, :] // w
+        )
+        b_off = tl.where(m_off, b_L, 0.0)
+        b_INV = b_INV + tl.dot(
+            b_INV,
+            tl.dot(b_off, b_INV, input_precision="ieee"),
+            input_precision="ieee",
+        )
+        w = 2 * w
+
+    tl.store(ws_inv_mqk + cc_off, b_INV, cache_modifier=CM_WS)
+
+
+_K2_FALLBACK_CONFIG = triton.Config({"BW": 16}, num_warps=2, num_stages=2)
+
+_K2_CONFIGS: list = (
+    [
+        triton.Config({"BW": BW}, num_warps=nw, num_stages=ns)
+        for BW in [16, 32, 64, 128]
+        for nw in [2, 4]
+        for ns in [1, 2, 3]
+    ]
+    if CHUNK_DELTA_ATTN_TRITON_AUTOTUNE
+    else chunk_delta_attn_tuned_config_shortlist(
+        "flash_kda_segment_kernel", [_K2_FALLBACK_CONFIG]
+    )
+)
+_K2_DEFAULT_CONFIG = _K2_CONFIGS[0]
+
+
+def _seg_occupancy_class(num_segs: int) -> int:
+    """Bucket of ``num_segs`` for K2's autotune key.
+
+    The grid is ``cdiv(W, BW) * num_segs * H``, so the best BW moves with the
+    segment count: one segment per sequence leaves BW=64 with a quarter of the
+    blocks BW=16 gets, and picking 64 there costs 2.3x. Keying on the exact
+    count would re-tune per batch, and a power-of-two bucket already separates
+    the schedules that differ.
+    """
+    return max(1, num_segs).bit_length()
+
+
+@triton.autotune(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN", _K2_CONFIGS, default_config=_K2_DEFAULT_CONFIG
+    ),
+    # HAS_V / COMPUTE_OUTPUT are in the key because the three passes below have
+    # very different per-iteration cost and must not share a tuned config, and
+    # NUM_SEGS_CLASS is there for the same reason -- without it the segmented
+    # and unsegmented schedules collide and whichever runs first sets the
+    # config for both, a result the on-disk cache then keeps.
+    key=[
+        "H",
+        "K",
+        "W",
+        "C",
+        "HAS_V",
+        "COMPUTE_OUTPUT",
+        "NUM_SEGS_CLASS",
+        "PAGED_CACHE",
+    ],
+    **autotune_cache_kwargs,
+)
+@triton.heuristics(
+    {
+        "PAGED_CACHE": lambda args: args["state_cache"] is not None,
+        "PAGED_H_IN": lambda args: (
+            args["state_cache"] is not None and args["h_in"] is None
+        ),
+    }
+)
+@triton.jit
+def _flash_kda_segment_kernel(
+    ws_kd,
+    ws_qd,
+    ws_kr,
+    ws_gt,
+    ws_inv_mqk,
+    v_input,
+    beta_raw,
+    out,
+    h_in,
+    h_out,
+    final_state,
+    seg_chunk_base,
+    seg_nchunks,
+    seg_tok_base,
+    seg_tok_end,
+    seg_seq,
+    seg_is_last,
+    TOTAL_TILES,
+    NUM_SEGS_CLASS,  # tuning discriminator only; see _seg_occupancy_class
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    W: tl.constexpr,
+    C: tl.constexpr,
+    BW: tl.constexpr,
+    INIT_IDENTITY: tl.constexpr,
+    HAS_H_IN: tl.constexpr,
+    HAS_V: tl.constexpr,
+    COMPUTE_OUTPUT: tl.constexpr,
+    STORE_H_OUT: tl.constexpr,
+    STORE_FINAL: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    CM_OUT: tl.constexpr = "",
+    state_cache=None,
+    state_indices=None,
+    has_initial_state=None,
+    cache_stride=0,
+    PAGED_CACHE: tl.constexpr = False,
+    PAGED_H_IN: tl.constexpr = False,
+):
+    """Delta-rule recurrence over one segment of chunks.
+
+    The state update is affine in the incoming state, ``h' = A_seg h + b_seg``,
+    so the same kernel serves all three passes of the segmented (context
+    parallel) schedule by varying only how it is seeded and what it stores:
+
+      * ``h=0``, real ``v``            -> ``b_seg``   (the affine part)
+      * ``h=I``, ``v=0`` (``W = K``)   -> ``A_seg``   (the linear part, one
+        column block per program, so the operator is obtained by propagating a
+        basis rather than by multiplying out per-chunk operators)
+      * ``h=h_in`` from the scan, real ``v``, ``COMPUTE_OUTPUT`` -> the output
+
+    With one segment per sequence this degenerates to a plain sequential scan
+    and only the third form runs.
+    """
+    # Every V block of a (segment, head) re-reads its chunk workspace; remapped,
+    # they land on one XCD and share its L2 instead of each pulling it through
+    # their own.
+    n_w = tl.num_programs(0)
+    pid = remap_xcd(
+        tl.program_id(1) * n_w + tl.program_id(0), n_w * tl.num_programs(1), NUM_XCDS
+    )
+    i_w = (pid % n_w).to(tl.int64)
+    i_sh = (pid // n_w).to(tl.int64)
+    i_seg, i_h = i_sh // H, i_sh % H
+
+    chunk_base = tl.load(seg_chunk_base + i_seg).to(tl.int64)
+    n_chunks = tl.load(seg_nchunks + i_seg)
+    tok_base = tl.load(seg_tok_base + i_seg).to(tl.int64)
+    tok_end = tl.load(seg_tok_end + i_seg).to(tl.int64)
+
+    o_c = tl.arange(0, C)
+    o_k1 = tl.arange(0, 64)
+    o_k2 = 64 + tl.arange(0, 64)
+    o_w = i_w * BW + tl.arange(0, BW)
+    m_w = o_w < W
+
+    # The state is [K, W]; K is split into two 64-row halves so each tile is a
+    # [64, BW] fp32 register block.
+    if INIT_IDENTITY:
+        b_h1 = tl.where(o_k1[:, None] == o_w[None, :], 1.0, 0.0)
+        b_h2 = tl.where(o_k2[:, None] == o_w[None, :], 1.0, 0.0)
+    elif HAS_H_IN:
+        if PAGED_H_IN:
+            i_n = tl.load(seg_seq + i_seg).to(tl.int64)
+            slot = tl.load(state_indices + i_n).to(tl.int64)
+            # A zero-start sequence's slot may hold a previous owner's state:
+            # mask the load so it is never read, not read and then discarded.
+            take = tl.load(has_initial_state + i_n).to(tl.int1)
+            m_h = m_w[None, :] & take
+            f_off = slot * cache_stride + i_h * V * K + o_w[None, :] * K
+            b_h1 = tl.load(state_cache + f_off + o_k1[:, None], mask=m_h, other=0.0).to(
+                tl.float32
+            )
+            b_h2 = tl.load(state_cache + f_off + o_k2[:, None], mask=m_h, other=0.0).to(
+                tl.float32
+            )
+        else:
+            s_off = (i_seg * H + i_h) * K * W + o_w[None, :]
+            b_h1 = tl.load(
+                h_in + s_off + o_k1[:, None] * W, mask=m_w[None, :], other=0.0
+            )
+            b_h2 = tl.load(
+                h_in + s_off + o_k2[:, None] * W, mask=m_w[None, :], other=0.0
+            )
+            b_h1 = b_h1.to(tl.float32)
+            b_h2 = b_h2.to(tl.float32)
+    else:
+        b_h1 = tl.zeros([64, BW], dtype=tl.float32)
+        b_h2 = tl.zeros([64, BW], dtype=tl.float32)
+
+    for j in range(n_chunks):
+        ws_idx = i_h * TOTAL_TILES + chunk_base + j
+        ck = ws_idx * C * K
+        t0 = tok_base + j * C
+        m_c = (t0 + o_c) < tok_end
+        m_cw = m_c[:, None] & m_w[None, :]
+
+        b_h1_bf = b_h1.to(tl.bfloat16)
+        b_h2_bf = b_h2.to(tl.bfloat16)
+
+        b_kd1 = tl.load(ws_kd + ck + o_c[:, None] * K + o_k1[None, :])
+        b_kd2 = tl.load(ws_kd + ck + o_c[:, None] * K + o_k2[None, :])
+        b_tmp = tl.dot(b_kd1, b_h1_bf) + tl.dot(b_kd2, b_h2_bf)
+
+        vo_off = t0 * H * V + i_h * V + o_c[:, None] * (H * V) + o_w[None, :]
+        if HAS_V:
+            b_v = tl.load(v_input + vo_off, mask=m_cw, other=0.0).to(tl.float32)
+        else:
+            b_v = tl.zeros([C, BW], dtype=tl.float32)
+
+        p_beta = beta_raw + t0 * H + i_h + o_c * H
+        b_beta = tl.sigmoid(tl.load(p_beta, mask=m_c, other=0.0).to(tl.float32))
+
+        # Tail rows must stay zero: U feeds the state update, which sums over all
+        # C rows regardless of how many are real.
+        b_u = tl.where(m_c[:, None], (b_v - b_tmp) * b_beta[:, None], 0.0)
+
+        cc = ws_idx * 2 * C * C + o_c[:, None] * C + o_c[None, :]
+        b_inv = tl.load(ws_inv_mqk + cc)
+        b_U = tl.dot(b_inv, b_u.to(ws_inv_mqk.dtype.element_ty))
+
+        if COMPUTE_OUTPUT:
+            b_mqk = tl.load(ws_inv_mqk + cc + C * C)
+            b_qd1 = tl.load(ws_qd + ck + o_c[:, None] * K + o_k1[None, :])
+            b_qd2 = tl.load(ws_qd + ck + o_c[:, None] * K + o_k2[None, :])
+            b_o = tl.dot(b_qd1, b_h1_bf) + tl.dot(b_qd2, b_h2_bf)
+            b_o += tl.dot(b_mqk, b_U.to(b_mqk.dtype))
+            tl.store(
+                out + vo_off,
+                b_o.to(out.dtype.element_ty),
+                mask=m_cw,
+                cache_modifier=CM_OUT,
+            )
+
+        b_gt1 = tl.load(ws_gt + ws_idx * K + o_k1).to(tl.float32)
+        b_gt2 = tl.load(ws_gt + ws_idx * K + o_k2).to(tl.float32)
+
+        # The recurrence's own matmuls stay in bf16: widening them costs about
+        # 40% of the kernel and moved no error bound measurably, since the state
+        # they feed is accumulated in fp32 either way and U already carries
+        # whatever the inverse above lost.
+        b_U_bf = b_U.to(tl.bfloat16)
+        b_kr1_t = tl.load(ws_kr + ck + o_k1[:, None] + o_c[None, :] * K)
+        b_kr2_t = tl.load(ws_kr + ck + o_k2[:, None] + o_c[None, :] * K)
+
+        b_h1 = b_h1 * b_gt1[:, None] + tl.dot(b_kr1_t, b_U_bf).to(tl.float32)
+        b_h2 = b_h2 * b_gt2[:, None] + tl.dot(b_kr2_t, b_U_bf).to(tl.float32)
+
+    if STORE_H_OUT:
+        s_off = (i_seg * H + i_h) * K * W + o_w[None, :]
+        e_ty = h_out.dtype.element_ty
+        tl.store(h_out + s_off + o_k1[:, None] * W, b_h1.to(e_ty), mask=m_w[None, :])
+        tl.store(h_out + s_off + o_k2[:, None] * W, b_h2.to(e_ty), mask=m_w[None, :])
+
+    # Not merged into one condition: the outer test is a constexpr, and when it
+    # is false final_state is a null pointer and seg_is_last must not be read.
+    if STORE_FINAL:  # noqa: SIM102
+        if tl.load(seg_is_last + i_seg) == 1:
+            i_n = tl.load(seg_seq + i_seg).to(tl.int64)
+            dt_s = tl.float32 if PAGED_CACHE else final_state.dtype.element_ty
+            if PAGED_CACHE:
+                slot = tl.load(state_indices + i_n).to(tl.int64)
+                f_off = slot * cache_stride + i_h * V * K + o_w[None, :] * K
+                tl.store(
+                    state_cache + f_off + o_k1[:, None],
+                    b_h1.to(dt_s),
+                    mask=m_w[None, :],
+                )
+                tl.store(
+                    state_cache + f_off + o_k2[:, None],
+                    b_h2.to(dt_s),
+                    mask=m_w[None, :],
+                )
+            elif STATE_V_FIRST:
+                f_off = (i_n * H + i_h) * V * K + o_w[None, :] * K
+                tl.store(
+                    final_state + f_off + o_k1[:, None],
+                    b_h1.to(dt_s),
+                    mask=m_w[None, :],
+                )
+                tl.store(
+                    final_state + f_off + o_k2[:, None],
+                    b_h2.to(dt_s),
+                    mask=m_w[None, :],
+                )
+            else:
+                f_off = (i_n * H + i_h) * K * V + o_w[None, :]
+                tl.store(
+                    final_state + f_off + o_k1[:, None] * V,
+                    b_h1.to(dt_s),
+                    mask=m_w[None, :],
+                )
+                tl.store(
+                    final_state + f_off + o_k2[:, None] * V,
+                    b_h2.to(dt_s),
+                    mask=m_w[None, :],
+                )
+
+
+@triton.heuristics(
+    {
+        "HAS_H0": lambda args: (
+            args["h0"] is not None or args["state_cache"] is not None
+        ),
+        "PAGED_CACHE": lambda args: args["state_cache"] is not None,
+    }
+)
+@triton.jit
+def _flash_kda_seg_scan_kernel(
+    A_seg,
+    b_seg,
+    h_in,
+    h0,
+    seq_seg_off,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    HAS_H0: tl.constexpr,
+    state_cache=None,
+    state_indices=None,
+    has_initial_state=None,
+    cache_stride=0,
+    PAGED_CACHE: tl.constexpr = False,
+):
+    """Serial scan across a sequence's segments: ``h <- A_seg h + b_seg``.
+
+    Only runs once per segment rather than once per chunk, so its serial depth
+    is the segment count (single digits) instead of the chunk count.
+    """
+    i_v = tl.program_id(0).to(tl.int64)
+    i_nh = tl.program_id(1).to(tl.int64)
+    i_n, i_h = i_nh // H, i_nh % H
+
+    s0 = tl.load(seq_seg_off + i_n).to(tl.int64)
+    s1 = tl.load(seq_seg_off + i_n + 1).to(tl.int64)
+
+    o_k1 = tl.arange(0, 64)
+    o_k2 = 64 + tl.arange(0, 64)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_v = o_v < V
+
+    if HAS_H0:
+        if PAGED_CACHE:
+            slot = tl.load(state_indices + i_n).to(tl.int64)
+            take = tl.load(has_initial_state + i_n).to(tl.int1)
+            m_h = m_v[None, :] & take
+            f_off = slot * cache_stride + i_h * V * K + o_v[None, :] * K
+            b_h1 = tl.load(state_cache + f_off + o_k1[:, None], mask=m_h, other=0.0).to(
+                tl.float32
+            )
+            b_h2 = tl.load(state_cache + f_off + o_k2[:, None], mask=m_h, other=0.0).to(
+                tl.float32
+            )
+        else:
+            base = (i_n * H + i_h) * K * V + o_v[None, :]
+            b_h1 = tl.load(
+                h0 + base + o_k1[:, None] * V, mask=m_v[None, :], other=0.0
+            ).to(tl.float32)
+            b_h2 = tl.load(
+                h0 + base + o_k2[:, None] * V, mask=m_v[None, :], other=0.0
+            ).to(tl.float32)
+    else:
+        b_h1 = tl.zeros([64, BV], dtype=tl.float32)
+        b_h2 = tl.zeros([64, BV], dtype=tl.float32)
+
+    for s in range(s0, s1):
+        hb = (s * H + i_h) * K * V + o_v[None, :]
+        tl.store(h_in + hb + o_k1[:, None] * V, b_h1, mask=m_v[None, :])
+        tl.store(h_in + hb + o_k2[:, None] * V, b_h2, mask=m_v[None, :])
+
+        # A_seg is stored bf16: the dots below consume it as bf16 anyway, and at
+        # this block count the scan is bound by how fast it can pull the
+        # operator in, not by arithmetic.
+        ab = (s * H + i_h) * K * K
+        b_A11 = tl.load(A_seg + ab + o_k1[:, None] * K + o_k1[None, :])
+        b_A12 = tl.load(A_seg + ab + o_k1[:, None] * K + o_k2[None, :])
+        b_A21 = tl.load(A_seg + ab + o_k2[:, None] * K + o_k1[None, :])
+        b_A22 = tl.load(A_seg + ab + o_k2[:, None] * K + o_k2[None, :])
+
+        b_h1_bf = b_h1.to(tl.bfloat16)
+        b_h2_bf = b_h2.to(tl.bfloat16)
+        b_n1 = tl.dot(b_A11, b_h1_bf) + tl.dot(b_A12, b_h2_bf)
+        b_n2 = tl.dot(b_A21, b_h1_bf) + tl.dot(b_A22, b_h2_bf)
+
+        b_h1 = b_n1 + tl.load(
+            b_seg + hb + o_k1[:, None] * V, mask=m_v[None, :], other=0.0
+        )
+        b_h2 = b_n2 + tl.load(
+            b_seg + hb + o_k2[:, None] * V, mask=m_v[None, :], other=0.0
+        )
+
+
+@triton.jit
+def _seg_scan_load_b(
+    b_seg, s, hb, m_v, H: tl.constexpr, K: tl.constexpr, V: tl.constexpr
+):
+    return tl.load(b_seg + s * H * K * V + hb, mask=m_v[None, :], other=0.0)
+
+
+@triton.jit
+def _seg_scan_clamp(s, s0, s_end):
+    """``s`` moved into the updates ``[s0, s_end)``, or ``s0`` if there are none."""
+    return tl.maximum(tl.minimum(s, s_end - 1), s0)
+
+
+@triton.heuristics(
+    {
+        "HAS_H0": lambda args: (
+            args["h0"] is not None or args["state_cache"] is not None
+        ),
+        "PAGED_CACHE": lambda args: args["state_cache"] is not None,
+    }
+)
+@triton.jit
+def _flash_kda_seg_scan_prefetch_kernel(
+    A_seg,
+    b_seg,
+    h_in,
+    h0,
+    seq_seg_off,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    HAS_H0: tl.constexpr,
+    state_cache=None,
+    state_indices=None,
+    has_initial_state=None,
+    cache_stride=0,
+    PAGED_CACHE: tl.constexpr = False,
+):
+    """``_flash_kda_seg_scan_kernel`` with each load issued ahead of the update
+    that needs it.
+
+    The scan is a chain of dependent updates, so every wait is paid in full:
+    that kernel loads b_seg in the update that adds it, two memory round trips
+    per update. Here a trip does two updates and loads the next trip's b_seg,
+    two to three updates ahead; A_seg, a dot operand, is what the software
+    pipeliner prefetches (it leaves other loads alone). The last segment's
+    update, which nothing reads, is not done.
+    """
+    i_v = tl.program_id(0).to(tl.int64)
+    i_nh = tl.program_id(1).to(tl.int64)
+    i_n, i_h = i_nh // H, i_nh % H
+
+    s0 = tl.load(seq_seg_off + i_n).to(tl.int64)
+    # Update s takes h_in[s] to h_in[s + 1].
+    s_end = tl.load(seq_seg_off + i_n + 1).to(tl.int64) - 1
+
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_v = o_v < V
+    hb = i_h * K * V + o_k[:, None] * V + o_v[None, :]
+    ab = i_h * K * K + o_k[:, None] * K + o_k[None, :]
+
+    if HAS_H0:
+        if PAGED_CACHE:
+            slot = tl.load(state_indices + i_n).to(tl.int64)
+            take = tl.load(has_initial_state + i_n).to(tl.int1)
+            f_off = slot * cache_stride + i_h * V * K + o_v[None, :] * K
+            b_h = tl.load(
+                state_cache + f_off + o_k[:, None], mask=m_v[None, :] & take, other=0.0
+            ).to(tl.float32)
+        else:
+            b_h = tl.load(h0 + i_n * H * K * V + hb, mask=m_v[None, :], other=0.0).to(
+                tl.float32
+            )
+    else:
+        b_h = tl.zeros([K, BV], dtype=tl.float32)
+    tl.store(h_in + s0 * H * K * V + hb, b_h, mask=m_v[None, :])
+
+    # Segment indices are clamped into the updates, which keeps every load in
+    # bounds: the loads past the last update re-read its segment, and an odd
+    # count's last trip computes a second update from it and drops it.
+    b_n0 = _seg_scan_load_b(b_seg, s0, hb, m_v, H, K, V)
+    b_n1 = _seg_scan_load_b(b_seg, _seg_scan_clamp(s0 + 1, s0, s_end), hb, m_v, H, K, V)
+    for s in range(s0, s_end, 2):
+        s_b = _seg_scan_clamp(s + 1, s0, s_end)
+        b_c0 = b_n0
+        b_c1 = b_n1
+        b_n0 = _seg_scan_load_b(
+            b_seg, _seg_scan_clamp(s + 2, s0, s_end), hb, m_v, H, K, V
+        )
+        b_n1 = _seg_scan_load_b(
+            b_seg, _seg_scan_clamp(s + 3, s0, s_end), hb, m_v, H, K, V
+        )
+        b_A0 = tl.load(A_seg + s * H * K * K + ab)
+        b_A1 = tl.load(A_seg + s_b * H * K * K + ab)
+
+        b_h = tl.dot(b_A0, b_h.to(tl.bfloat16)) + b_c0
+        tl.store(h_in + (s + 1) * H * K * V + hb, b_h, mask=m_v[None, :])
+        has2 = s + 1 < s_end
+        b_h = tl.where(has2, tl.dot(b_A1, b_h.to(tl.bfloat16)) + b_c1, b_h)
+        tl.store(h_in + (s + 2) * H * K * V + hb, b_h, mask=m_v[None, :] & has2)
+
+
+def flash_kda_supported(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    chunk_size: int,
+    safe_gate: bool,
+    use_gate_in_kernel: bool,
+    use_qk_l2norm_in_kernel: bool,
+    use_beta_sigmoid_in_kernel: bool,
+    lower_bound: float | None,
+    A_log: torch.Tensor | None,
+) -> bool:
+    """Whether ``flash_kda_fwd`` can serve this call (see the module docstring)."""
+    K = q.shape[-1]
+    HV, V = v.shape[2], v.shape[-1]
+    return (
+        chunk_size == FLASH_KDA_CHUNK
+        and safe_gate
+        and K == FLASH_KDA_K
+        and V == FLASH_KDA_K
+        and HV == q.shape[2]
+        and q.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and use_gate_in_kernel
+        and use_qk_l2norm_in_kernel
+        and use_beta_sigmoid_in_kernel
+        and lower_bound is not None
+        and A_log is not None
+    )
+
+
+def _gluon_k1_usable(C: int, K: int) -> bool:
+    return (
+        _GLUON_ARCH_OK
+        and C == FLASH_KDA_CHUNK
+        and K == FLASH_KDA_K
+        and _published_gluon_schedule("k1_prepare_gluon") is not None
+    )
+
+
+def _gluon_k2_usable(C: int, K: int, V: int) -> bool:
+    """Whether the Gluon K2 can stand in for the Triton one on this call."""
+    return (
+        _GLUON_ARCH_OK
+        and C == FLASH_KDA_CHUNK
+        and K == FLASH_KDA_K
+        and V == FLASH_KDA_K
+    )
+
+
+def _tdm_operand(x: torch.Tensor, tdm: bool) -> tuple[torch.Tensor, int]:
+    """``x`` ``[B, T, H, D]`` and its token stride: ``x`` itself if ``tdm`` and
+    the gfx1250 Gluon kernels can read it in place, else a packed copy."""
+    B, T, H, D = x.shape
+    if tdm and B == 1 and T > 1 and x.stride(3) == 1 and (H == 1 or x.stride(2) == D):
+        return x, x.stride(1)
+    return x.contiguous(), H * D
+
+
+def _log_route(k1: bool, k2a: bool | None, k2c: bool, C: int, K: int, V: int) -> None:
+    """Log the resolved routes once each; ``k2a`` is None when there is no pass A."""
+    key = (k1, k2a, k2c, C, K, V)
+    if key in _LOGGED_ROUTES:
+        return
+    _LOGGED_ROUTES.add(key)
+
+    def name(gluon):
+        return "none" if gluon is None else "gluon" if gluon else "triton"
+
+    _LOGGER.info(
+        "flash_kda route: K1=%s K2 pass A=%s pass C=%s (C=%d K=%d V=%d arch=%s)",
+        name(k1),
+        name(k2a),
+        name(k2c),
+        C,
+        K,
+        V,
+        DEVICE_ARCH,
+    )
+
+
+# The gfx1250 K1's layouts are built for four warps. waves_per_eu=0 leaves the
+# occupancy to the compiler.
+_K1_GLUON_FALLBACK = triton.Config({"waves_per_eu": 0}, num_warps=4)
+
+
+@functools.cache
+def _k1_gluon_schedule() -> tuple[int, int]:
+    """``(num_warps, waves_per_eu)`` for the gfx1250 Gluon K1."""
+    cfg = chunk_delta_attn_tuned_config(
+        "k1_prepare_gluon", _K1_GLUON_FALLBACK, backend="gluon"
+    )
+    return cfg.num_warps, cfg.kwargs["waves_per_eu"]
+
+
+# BW=64 at four warps is the narrowest tile that the gfx950 and gfx1250 kernels
+# both accept; only the gfx1250 kernels read CPL. With a zero floor, a device
+# with no published table takes this schedule in the wide branch.
+_K2_GLUON_FALLBACK = triton.Config(
+    {"BW": 64, "CPL": 2, "MIN_BLOCKS_PER_CU": 0, "waves_per_eu": 0}, num_warps=4
+)
+_UNPUBLISHED = triton.Config({})
+
+
+@functools.cache
+def _published_gluon_schedule(name: str) -> triton.Config | None:
+    """The published Gluon schedule ``name``, or None. The gfx950 K1 and pass C
+    have no Python fallback: without a published schedule they are not routed to."""
+    cfg = chunk_delta_attn_tuned_config(name, _UNPUBLISHED, backend="gluon")
+    return None if cfg is _UNPUBLISHED else cfg
+
+
+@functools.cache
+def _k2_gluon_schedule(
+    W: int, num_segs: int, H: int, kernel: str = "k2_ab_fused_gluon", wide: bool = False
+) -> triton.Config:
+    """The schedule of the Gluon K2 pass ``kernel``, which does not autotune:
+    ``BW``, ``num_warps``, ``waves_per_eu`` and, on gfx1250, ``CPL``, the
+    chunks per TDM load. The wide tile is taken while the grid stays above the
+    published blocks-per-CU floor."""
+    cus = get_num_sms()
+
+    def fills(cfg):
+        blocks = (W // cfg.kwargs["BW"]) * num_segs * H
+        return (
+            W % cfg.kwargs["BW"] == 0
+            and blocks >= cfg.kwargs["MIN_BLOCKS_PER_CU"] * cus
+        )
+
+    packed = _published_gluon_schedule(f"{kernel}_packed")
+    if packed is not None and fills(packed):
+        return packed
+    cfg = chunk_delta_attn_tuned_config(
+        f"{kernel}_wide", _K2_GLUON_FALLBACK, backend="gluon"
+    )
+    if fills(cfg) or (wide and W % cfg.kwargs["BW"] == 0):
+        return cfg
+    return chunk_delta_attn_tuned_config(
+        f"{kernel}_narrow", _K2_GLUON_FALLBACK, backend="gluon"
+    )
+
+
+def _k2c_gluon_schedule(segmented: bool) -> triton.Config | None:
+    """The schedule of the gfx950 Gluon pass C: ``BW``, ``num_warps`` and the
+    ``MIN_BLOCKS_PER_CU`` floor below which the Triton pass C is faster."""
+    return _published_gluon_schedule(
+        "k2_c_gluon_segmented" if segmented else "k2_c_gluon"
+    )
+
+
+def _k2c_gluon_usable(segmented: bool, W: int, num_segs: int, H: int) -> bool:
+    """Whether the Gluon pass C beats the Triton one on this grid. With few
+    (segment, head) pairs the serial walk dominates and the Triton kernel's
+    narrower BW=16 tile wins."""
+    sched = _k2c_gluon_schedule(segmented)
+    if sched is None:
+        return False
+    blocks = triton.cdiv(W, sched.kwargs["BW"]) * num_segs * H
+    floor = sched.kwargs.get("MIN_BLOCKS_PER_CU", 0)
+    return not _K2C_ROUTE_BY_SIZE or blocks >= floor * get_num_sms()
+
+
+# Blocks pass A should end up with, in units of the CU count.
+_SEG_TARGET_BLOCKS = 3
+_SEG_MAX_SEGMENTS = 16
+_SEG_MIN_CHUNKS = 64
+# Where none is published: segments of at most 32 chunks, unless that takes more
+# than _SEG_MAX_SEGMENTS of them.
+_SEG_LIMITS_FALLBACK = triton.Config({"MAX_CHUNKS": 32, "HARD_CAP": False})
+
+
+@functools.cache
+def _seg_limits() -> tuple[int, bool]:
+    """``(MAX_CHUNKS, HARD_CAP)``: the longest segment, and whether that bound
+    holds past ``_SEG_MAX_SEGMENTS``."""
+    cfg = chunk_delta_attn_tuned_config("flash_kda_segments", _SEG_LIMITS_FALLBACK)
+    return cfg.kwargs["MAX_CHUNKS"], cfg.kwargs["HARD_CAP"]
+
+
+_SCAN_BV_NARROW = 16
+_SCAN_BV_WIDE = 32
+
+
+def _scan_bv(n_seqs: int, H: int, V: int) -> tuple[int, int]:
+    # Not a fill-the-CUs knob: under 16 always loses; this asks only if 16 overshoots.
+    if (V // _SCAN_BV_NARROW) * n_seqs * H > get_num_sms():
+        return _SCAN_BV_WIDE, 2
+    return _SCAN_BV_NARROW, 4
+
+
+def _scan_schedule(n_seqs: int, H: int, V: int) -> tuple[int, int]:
+    """``(BV, num_warps)`` for pass B."""
+    if not _SCAN_PREFETCH:
+        return _scan_bv(n_seqs, H, V)
+    # The prefetching scan keeps BV=16 past one block per CU as well: ahead of 32
+    # on every H=12 grid measured (to 480 blocks), ~20% behind where the blocks
+    # that have to share a CU run deep scans too (H=24 N=2, H=48 N=1). A third
+    # stage (213 KB of LDS) is no faster on its own, and in the forward it slows
+    # the passes around it.
+    return _SCAN_BV_NARROW, 4
+
+
+def _choose_chunks_per_seg(n_chunks_max, n_seqs, H, V, nchs=None, one_wave=True) -> int:
+    """Segment length in chunks, or ``n_chunks_max`` to disable segmentation.
+
+    The recurrence kernel gets ``n_segments * H * (V / BW)`` blocks, so with one
+    segment per sequence a low head count leaves most of the device idle: at
+    H=12, V=128 that is 48 blocks against 256 CUs. Segmenting buys blocks by
+    turning one pass into three -- pass A, the cross-segment scan, and pass C --
+    so what decides the length is the block count it lands on rather than the
+    sequence length on its own. Segments are also kept to the published
+    ``MAX_CHUNKS`` (see ``_seg_limits``).
+    """
+    override = os.getenv("CHUNK_DELTA_ATTN_FLASH_KDA_SEG", "").strip()
+    if override:
+        val = int(override)
+        return n_chunks_max if val <= 0 else val
+    wide = _published_gluon_schedule("k2_c_gluon_packed") if nchs is not None else None
+    blocks = n_seqs * H * max(1, V // (wide.kwargs["BW"] if wide else 32))
+    cus = get_num_sms()
+    # There has to be idle capacity to absorb the extra passes, unless the longest
+    # walk outlasts the device's share of all the work (one long sequence).
+    if blocks > cus and (
+        nchs is None or sum(nchs) * (blocks // n_seqs) >= n_chunks_max * cus
+    ):
+        return n_chunks_max
+    if nchs is not None and one_wave:
+        # Shortest length that fits one wave of the CUs, if it pays for pass A + scan.
+        P = _published_gluon_schedule("flash_kda_gluon_plan").kwargs
+        lo = max(P["A8_MIN_LEN"], triton.cdiv(n_chunks_max, P["A8_MAX_SEGS"]))
+        lo = max(lo, round(P.get("SEG_SQRT", 0) * math.sqrt(n_chunks_max)))
+        long = P.get("PACKED_FROM_LEN")
+
+        def fit(room):
+            for L in range(lo, n_chunks_max):
+                progs = sum(triton.cdiv(n, L) for n in nchs if n > L or not long) * H
+                if progs <= room:
+                    return L, progs
+            return n_chunks_max, 0
+
+        L, progs = (
+            fit(cus) if n_chunks_max >= P.get("MIN_CHUNKS", 0) else (n_chunks_max, 0)
+        )
+        if long and long <= L < n_chunks_max:
+            L, progs = fit(2 * cus)
+        cost = P["SEG_FIXED_STEPS"] + P["SEG_DEVICE_STEPS"] * progs / cus
+        return n_chunks_max if n_chunks_max - L <= cost else L
+    # And enough depth to amortize them, which no amount of idle capacity makes
+    # up for.
+    if n_chunks_max < _SEG_MIN_CHUNKS:
+        return n_chunks_max
+    # Enough segments to fill the device (capped, as the extra passes scale with
+    # the count), and enough to bound a segment's serial walk.
+    max_chunks, hard_cap = _seg_limits()
+    by_length = n_chunks_max / max_chunks
+    if not hard_cap:
+        by_length = min(_SEG_MAX_SEGMENTS, by_length)
+    segs = max(min(_SEG_MAX_SEGMENTS, _SEG_TARGET_BLOCKS * cus / blocks), by_length)
+    # To a power of two, the grid the constants were calibrated on.
+    return max(1, min(n_chunks_max, 1 << round(math.log2(n_chunks_max / segs))))
+
+
+@tensor_cache
+def _seq_bounds(cu_seqlens: torch.Tensor) -> tuple[tuple[int, int], ...]:
+    """``(bos, eos)`` per sequence.
+
+    Cached because reading it is a device-to-host copy issued after the prepare
+    kernel has been queued, so an uncached call stalls the host on that kernel
+    on every invocation rather than only on the first.
+    """
+    bounds = cu_seqlens.tolist()
+    return tuple((bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1))
+
+
+@tensor_cache
+def _tile_table(cu_seqlens: torch.Tensor, chunk_indices: torch.Tensor, C: int):
+    ci = chunk_indices.long()
+    tok0 = cu_seqlens.long()[ci[:, 0]] + ci[:, 1] * C
+    ln = torch.clamp(cu_seqlens.long()[ci[:, 0] + 1] - tok0, max=C)
+    return torch.stack([tok0, ln], 1).to(torch.int32).contiguous()
+
+
+@functools.lru_cache(maxsize=64)
+def _seg_plan(seqs, C, L, H, taper):
+    nchs = [triton.cdiv(e - b, C) for b, e in seqs]
+    lens = [
+        [L] * (triton.cdiv(n, L) - 1) + [n - L * (triton.cdiv(n, L) - 1)] for n in nchs
+    ]
+    longest = max(nchs)
+    k = nchs.count(longest)
+    b0 = triton.cdiv(longest, L)
+    spare = get_num_sms() // H - sum(map(len, lens))
+    if not taper:
+        return tuple(map(tuple, lens))
+    P = _published_gluon_schedule("flash_kda_gluon_plan").kwargs
+    smax = min(b0 + spare // k, max(b0, P["A8_MAX_SEGS"]))
+    if (
+        longest < max(P["TAPER_MIN_CHUNKS"], L + 1)
+        or longest > smax * L
+        or spare < k
+        or smax <= b0
+    ):
+        return tuple(map(tuple, lens))
+    c = longest / smax
+    while True:
+        t = []
+        while sum(t) < longest and len(t) < smax:
+            m = max(P["A8_MIN_LEN"], min(L, int(c - P["TAPER_RATE"] * len(t) + 1e-9)))
+            t.append(min(m, longest - sum(t)))
+        if sum(t) >= longest:
+            return tuple(tuple(t if n == longest else s) for n, s in zip(nchs, lens))
+        c += 0.05
+
+
+def _check_checkpoints(state, offsets, indices, N, H, V, K):
+    if state is None or state.dtype != torch.float32 or state.dim() != 4:
+        raise ValueError("checkpoint_state must be an fp32 [rows, H, V, K] tensor")
+    if tuple(state.shape[1:]) != (H, V, K) or state.stride()[1:] != (V * K, K, 1):
+        raise ValueError(
+            f"checkpoint_state rows must be packed [{H}, {V}, {K}] (V-first), got "
+            f"shape {tuple(state.shape)} and strides {state.stride()}"
+        )
+    # Read in place, never copied: they must be packed 1-D integer tensors.
+    for name, x in (
+        ("checkpoint_offsets", offsets),
+        ("checkpoint_state_indices", indices),
+    ):
+        if x is not None and (
+            x.dtype.is_floating_point or x.shape != (N,) or x.stride() != (1,)
+        ):
+            raise ValueError(f"{name} must be a contiguous integer [{N}] tensor")
+
+
+def _upload(rows, device, dtype=torch.int32):
+    # Pinned and non-blocking: a pageable copy would wait for the GPU queue.
+    return torch.tensor(rows, dtype=dtype, pin_memory=True).to(
+        device, non_blocking=True
+    )
+
+
+_WORKSPACES = {}
+_C_INTS = {torch.int32: ctypes.c_int32, torch.int64: ctypes.c_int64}
+
+
+def _workspace(name, shape, dtype, device):
+    key = (name, str(device), torch.cuda.current_stream(device).cuda_stream)
+    buf, views = _WORKSPACES.get(key, (None, None))
+    view = None if views is None else views.get((shape, dtype))
+    if view is not None:
+        return view
+    n = math.prod(shape) * dtype.itemsize
+    if buf is None or buf.numel() < n:
+        buf, views = torch.empty(n, dtype=torch.uint8, device=device), {}
+        _WORKSPACES[key] = (buf, views)
+    if len(views) > 64:
+        views.clear()
+    views[(shape, dtype)] = view = buf[:n].view(dtype).view(shape)
+    return view
+
+
+@functools.lru_cache(maxsize=64)
+def _host_tiles(seqs, C, dtype, device):
+    ci, tiles = [], []
+    for n, (bos, eos) in enumerate(seqs):
+        for c in range(triton.cdiv(eos - bos, C)):
+            ci.append([n, c])
+            tiles.append([bos + c * C, min(C, eos - bos - c * C)])
+    return _upload(ci, device, dtype), _upload(tiles, device)
+
+
+@functools.lru_cache(maxsize=64)
+def _scf_table(nsegs, H, NVS, device):
+    NX = get_num_xcds()  # pid % NX = XCD (round-robin dispatch)
+    streams, seg0 = [], 0
+    for n, nseg in enumerate(nsegs):
+        streams += [(n, h, nseg, seg0) for h in range(H)]
+        seg0 += nseg
+    P = sum(st[2] for st in streams)
+    scans = [[] for _ in range(NX)]
+    walks = [[] for _ in range(NX)]
+    x, rmax, done = 0, 1, 0
+    # XCD x ends at item round((x + 1) P / NX): boundaries on stream ends need no replica.
+    bnd = [((q + 1) * P + NX // 2) // NX for q in range(NX)]
+    for n, h, nseg, s0 in streams:
+        pieces, a = [], 0
+        while a < nseg:
+            while x < NX - 1 and done >= bnd[x]:
+                x += 1
+            take = min(nseg - a, max(bnd[x] - done, 1) if x < NX - 1 else nseg - a)
+            pieces.append((x, a, a + take))
+            done += take
+            a += take
+        rmax = max(rmax, len(pieces))
+        assert len(pieces) <= 8
+        nh = n * H + h
+        for r, (xp, a0, a1) in enumerate(pieces):
+            dn = 1 << 29 if r < len(pieces) - 1 else 0
+            items = [1 << 30 | dn | r << 26 | nh << 4 | v for v in range(NVS)]
+            scans[xp].append((items, a1 - 1))
+            for s in range(a0, a1):
+                aux = 0
+                if s == nseg - 1 and len(pieces) > 1:
+                    aux = sum(1 << q for q in range(len(pieces)) if q != r) | nh << 8
+                walks[xp].append((s, r << 26 | (s0 + s) * H + h, aux))
+    # Per XCD: scans first (longest first), then pass C by segment position.
+    lists = [
+        [
+            [e, cap]
+            for items, cap in sorted(scans[q], key=lambda t: -t[1])
+            for e in items
+        ]
+        + [[e, aux] for _, e, aux in sorted(walks[q], key=lambda t: t[0])]
+        for q in range(NX)
+    ]
+    tab = []
+    for i in range(max(len(lst) for lst in lists)):
+        for q in range(NX):
+            tab += lists[q][i] if i < len(lists[q]) else [-1, 0]
+    nscan = sum(len(scans[q]) * NVS for q in range(NX))
+    return _upload(tab, device), rmax, nscan
+
+
+_EPOCH_BUFS = {}
+
+
+def _call_epoch(device):
+    # One int32 counter per stream; the gfx950 K1 advances it on the device, so
+    # CUDA graph replays get a new epoch too.
+    key = ("epoch", str(device), torch.cuda.current_stream(device).cuda_stream)
+    if key not in _EPOCH_BUFS:
+        _EPOCH_BUFS[key] = torch.zeros(1, dtype=torch.int32, device=device)
+    return _EPOCH_BUFS[key]
+
+
+def _epoch_buf(name, device, n, dtype):
+    key = (name, str(device), torch.cuda.current_stream(device).cuda_stream)
+    buf = _EPOCH_BUFS.get(key)
+    if buf is None or buf.numel() < n:
+        buf = _EPOCH_BUFS[key] = torch.zeros(
+            max(n, 1 << 16), dtype=dtype, device=device
+        )
+    return buf, _call_epoch(device)
+
+
+@functools.lru_cache(maxsize=64)
+def _pass_a_rows(seqs, C, seg_lens, H, n_w, device):
+    rows, g_chunk, i_seg = [], 0, 0
+    for (bos, eos), lens in zip(seqs, seg_lens):
+        c0 = 0
+        for k, m in enumerate(lens):
+            if k != len(lens) - 1:
+                rows.append(
+                    [i_seg, g_chunk + c0, m, bos + c0 * C, min(bos + (c0 + m) * C, eos)]
+                )
+            c0 += m
+            i_seg += 1
+        g_chunk += c0
+    items = sorted((-r[2], i, h) for i, r in enumerate(rows) for h in range(H))
+    n = len(items)
+    NX = get_num_xcds()  # pass A's remap_xcd runs with NUM_XCDS = get_num_xcds()
+    G = n * n_w
+    ppx, tall = (G + NX - 1) // NX, G % NX or NX
+    starts = [min(x, tall) * ppx + max(0, x - tall) * (ppx - 1) for x in range(NX + 1)]
+    cus = max(1, get_num_sms() // NX)
+    slot = []  # (XCD, wave, CU) of table row q (programs q * n_w ..)
+    for q in range(n):
+        x = max(y for y in range(NX) if starts[y] <= q * n_w)
+        slot.append((x, (q * n_w - starts[x]) // cus, (q * n_w - starts[x]) % cus))
+    firsts = sorted(
+        (q for q in range(n) if slot[q][1] == 0), key=lambda q: slot[q][::-1]
+    )
+    order = dict(zip(firsts, items))
+    rest = items[len(firsts) :]
+    part = {(slot[q][0], slot[q][2]): -order[q][0] for q in firsts}
+    later = [q for q in range(n) if slot[q][1] > 0]
+    for q in sorted(later, key=lambda q: -part.get((slot[q][0], slot[q][2]), 0)):
+        order[q] = rest.pop()
+    tab = [rows[order[q][1]] + [order[q][2], 0, 0] for q in range(n)]
+    return _upload(tab, device)
+
+
+@functools.lru_cache(maxsize=64)
+def _scanned_segs(seg_lens, device):
+    ids, i = [], 0
+    for lens in seg_lens:
+        ids += [(-m, i + s) for s, m in enumerate(lens[:-1])]
+        i += len(lens)
+    return _upload([s for _, s in sorted(ids)], device)
+
+
+@functools.lru_cache(maxsize=64)
+def _build_segments(
+    seqs: tuple[tuple[int, int], ...],
+    C: int,
+    seg_lens: tuple,
+    device: torch.device,
+):
+    """Descriptors for the segmented recurrence.
+
+    Returns ``(desc, seq_seg_off, num_segs, max_segs_per_seq)`` where ``desc`` is
+    a ``[6, num_segs]`` int32 tensor holding, per segment: the global chunk index
+    it starts at (indexing the K1 workspace), its chunk count, its first and
+    one-past-last token, its sequence, and whether it ends that sequence.
+
+    Cached on the sequence bounds: building these costs a Python loop and a host
+    to device copy, which at this kernel's runtime is not noise, and a serving
+    loop repeats the same shapes.
+    """
+    chunk_base, nchunks, tok_base, tok_end, seq_id, is_last = [], [], [], [], [], []
+    seq_seg_off = [0]
+    g_chunk = 0
+    for i, ((bos, eos), lens) in enumerate(zip(seqs, seg_lens)):
+        nch = triton.cdiv(eos - bos, C)
+        nseg = len(lens)
+        for s in range(nseg):
+            c0 = sum(lens[:s])
+            m = lens[s]
+            chunk_base.append(g_chunk + c0)
+            nchunks.append(m)
+            tok_base.append(bos + c0 * C)
+            tok_end.append(min(bos + (c0 + m) * C, eos))
+            seq_id.append(i)
+            is_last.append(1 if s == nseg - 1 else 0)
+        seq_seg_off.append(len(chunk_base))
+        g_chunk += nch
+
+    desc = _upload([chunk_base, nchunks, tok_base, tok_end, seq_id, is_last], device)
+    desc = tuple(desc.unbind(0))
+    off = _upload(seq_seg_off, device)
+    max_per_seq = max(
+        seq_seg_off[i + 1] - seq_seg_off[i] for i in range(len(seq_seg_off) - 1)
+    )
+    return desc, off, len(chunk_base), max_per_seq
+
+
+_prepare_fast = fast_launch(_flash_kda_prepare_kernel)
+_segment_fast = fast_launch(_flash_kda_segment_kernel)
+_seg_scan_fast = fast_launch(_flash_kda_seg_scan_kernel)
+_seg_scan_prefetch_fast = fast_launch(_flash_kda_seg_scan_prefetch_kernel)
+
+
+def _check_paged_state_cache(
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    *,
+    N: int,
+    H: int,
+    V: int,
+    K: int,
+) -> None:
+    """Paged layout: each slot is dense ``[H, V, K]``; ``stride(0)`` may pad."""
+    if state_cache.dtype != torch.float32 or state_cache.dim() != 4:
+        raise ValueError("state_cache must be an fp32 [slots, H, V, K] tensor")
+    if tuple(state_cache.shape[1:]) != (H, V, K):
+        raise ValueError(
+            f"state_cache slot shape {tuple(state_cache.shape[1:])} != {(H, V, K)}"
+        )
+    # The kernel addresses slot * stride(0), so a smaller outer stride (an
+    # expanded view is 0) would make neighbouring slots share storage.
+    if (
+        state_cache.stride(-1) != 1
+        or state_cache.stride(2) != K
+        or state_cache.stride(1) != V * K
+        or state_cache.stride(0) < H * V * K
+    ):
+        raise ValueError(
+            f"state_cache strides {tuple(state_cache.stride())} are not dense "
+            f"[H, V, K] slots; stride(0) may be padded but not below {H * V * K}"
+        )
+    if state_indices.numel() != N or has_initial_state.numel() != N:
+        raise ValueError(f"state_indices and has_initial_state must have N={N} entries")
+
+
+@input_guard(
+    skip=(
+        "q",
+        "k",
+        "v",
+        "g",
+        "beta",
+        "state_cache",
+        "out",
+        "out_gate",
+        "checkpoint_state",
+        "checkpoint_offsets",
+        "checkpoint_state_indices",
+        "cu_seqlens_cpu",
+    )
+)
+def flash_kda_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    scale: float,
+    lower_bound: float,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    state_v_first: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunks_per_seg: int | None = None,
+    out: torch.Tensor | None = None,
+    state_cache: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    out_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-5,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_state_indices: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Two-kernel KDA forward, with an optional segmented (context parallel) scan.
+
+    Args:
+        q, k:               ``[B, T, H, 128]`` bf16.
+        v:                  ``[B, T, H, 128]`` bf16.
+        g:                  Raw gate ``[B, T, H, 128]``; activation and cumsum
+                            happen in K1.
+        beta:               Raw beta logits ``[B, T, H]``; sigmoid in-kernel.
+        A_log:              ``[H]`` fp32.
+        dt_bias:            ``[H * 128]`` fp32 or None.
+        scale:              Attention scale, folded into the decayed q.
+        lower_bound:        Gate lower bound (Kimi uses -5.0).
+        initial_state:      ``[N, H, K, V]`` fp32, or ``[N, H, V, K]`` when
+                            ``state_v_first``. None starts from zero.
+        output_final_state: Allocate and return the final state.
+        state_v_first:      V-first state layout.
+        cu_seqlens:         ``[N + 1]`` for varlen; ``B`` must be 1.
+        chunk_indices:      Output of ``prepare_chunk_indices``; computed here
+                            when omitted.
+        chunks_per_seg:     Segment length for the parallel scan. None picks a
+                            value from the head count; <= 0 disables it.
+        out:                Optional output buffer, same shape as ``v``, and
+                            contiguous: it is written in place rather than
+                            packed by ``input_guard``.
+        state_cache:        Optional paged fp32 V-first cache ``[slots, H, V, K]``.
+                            Each slot's ``[H, V, K]`` plane must be dense;
+                            ``stride(0)`` may be padded. This tensor is not
+                            packed by ``input_guard``.
+                            When set, the walk reads sequence ``n`` from row
+                            ``state_indices[n]`` if ``has_initial_state[n]`` and
+                            writes the final state back to the same row.
+        state_indices:      Int32 ``[N]`` cache row per sequence, each in
+                            ``[0, slots)``. Not range-checked: that would
+                            need a host sync per call.
+        has_initial_state:  Bool ``[N]``; false starts that sequence from zero.
+        out_gate:           Optional ``[B, T, H, V]`` gate of the fused output
+                            norm ``o = rmsnorm(o) * norm_weight * sigmoid(out_gate)``
+                            (RMS over V, fp32 math). Head and element strides
+                            must be ``V`` and 1; the token stride may be wider
+                            (a slice of a projection).
+        norm_weight:        ``[V]`` weight of the fused norm; required with
+                            ``out_gate``.
+        norm_eps:           Epsilon of the fused norm.
+        checkpoint_state:   fp32 ``[rows, H, V, K]`` destination of mid-prefill
+                            state snapshots (the paged ``state_cache`` layout).
+        checkpoint_offsets: Integer ``[N]``: snapshot each sequence's state after
+                            this many of its tokens. ``0``, an offset that is
+                            not a multiple of ``C``, or one not less than the
+                            sequence length writes nothing. gfx950 Gluon only.
+        checkpoint_state_indices: Integer ``[N]`` destination row per sequence
+                            (default: row ``n``); a negative row writes nothing.
+        cu_seqlens_cpu:     CPU copy of ``cu_seqlens``: the plan is built from it,
+                            with no device read-back.
+
+    Returns:
+        ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
+        ``None`` when ``state_cache`` is given, because the cache already holds
+        it.
+    """
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    C = FLASH_KDA_CHUNK
+    inv_block = min(FLASH_KDA_INV_BLOCK, C)
+    dev = q.device
+    paged = state_cache is not None
+    if paged:
+        if initial_state is not None:
+            raise ValueError("state_cache replaces initial_state")
+        if state_indices is None or has_initial_state is None:
+            raise ValueError("state_cache needs state_indices and has_initial_state")
+        if not state_v_first:
+            raise ValueError("paged state_cache is V-first")
+        if out is None:
+            raise ValueError("paged state_cache needs an explicit out buffer")
+    if out is not None:
+        if out.shape != v.shape:
+            raise ValueError(
+                f"out shape {tuple(out.shape)} does not match v {tuple(v.shape)}"
+            )
+        # K2 stores through packed [B, T, H, V] strides, and `out` is exempt
+        # from `input_guard` so the caller's buffer is what gets written. A
+        # strided view would need either its own strides in the kernel or a
+        # copy afterwards, and the point of taking `out` is to avoid the copy.
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+
+    norm = out_gate is not None
+    # The gate tiles are copied 16 B per lane: a token stride or base that is
+    # not 16 B aligned takes a packed copy.
+    if norm and (
+        (out_gate.stride(1) * out_gate.element_size()) % 16 or out_gate.data_ptr() % 16
+    ):
+        out_gate = out_gate.contiguous()
+    use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
+    use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
+    # The gfx950 Gluon K1 workspace is read only by the Gluon K2: all Gluon or none.
+    gluon_pipeline = DEVICE_ARCH == "gfx950" and use_gluon_k1 and use_gluon_k2
+    gluon_pipeline = gluon_pipeline and all(
+        _k2c_gluon_schedule(seg) is not None for seg in (0, 1)
+    )
+    gluon_pipeline = gluon_pipeline and (
+        _published_gluon_schedule("flash_kda_gluon_plan") is not None
+    )
+    use_gluon_k1 = use_gluon_k1 and (gluon_pipeline or DEVICE_ARCH != "gfx950")
+    use_gluon_k2 = use_gluon_k2 and (gluon_pipeline or DEVICE_ARCH != "gfx950")
+    if checkpoint_offsets is not None and not (
+        gluon_pipeline or (use_gluon_k2 and DEVICE_ARCH == "gfx1250")
+    ):
+        raise NotImplementedError(
+            "FlashKDA writes prefill checkpoints only on the Gluon pass C"
+        )
+    # The gfx950 Gluon K1 reads beta at its token stride; every other kernel needs
+    # it packed.
+    stride_beta = 0
+    flat = B == 1 or beta.stride(0) == T * beta.stride(1)
+    if gluon_pipeline and beta.stride(-1) == 1 and flat:
+        stride_beta = beta.stride(1)
+    else:
+        beta = beta.contiguous()
+    # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
+    # stride. Every other kernel needs them packed.
+    stride_q = stride_k = stride_g = H * K
+    stride_v = H * V
+    if not (
+        q.is_contiguous()
+        and k.is_contiguous()
+        and g.is_contiguous()
+        and v.is_contiguous()
+    ):
+        tdm = DEVICE_ARCH == "gfx1250"
+        q, stride_q = _tdm_operand(q, tdm and use_gluon_k1)
+        k, stride_k = _tdm_operand(k, tdm and use_gluon_k1)
+        g, stride_g = _tdm_operand(g, tdm and use_gluon_k1)
+        v, stride_v = _tdm_operand(v, tdm and use_gluon_k2)
+
+    host_tiles = None
+    if cu_seqlens is not None:
+        if B != 1:
+            raise ValueError(f"Varlen mode requires B=1, got {B}.")
+        N = cu_seqlens.numel() - 1
+        if cu_seqlens_cpu is not None:
+            c_int = _C_INTS.get(cu_seqlens_cpu.dtype)
+            if (
+                c_int is None
+                or cu_seqlens_cpu.device.type != "cpu"
+                or cu_seqlens_cpu.numel() != N + 1
+                or not cu_seqlens_cpu.is_contiguous()
+            ):
+                raise ValueError(
+                    f"cu_seqlens_cpu must be a contiguous int32/int64 CPU tensor of {N + 1}"
+                )
+            bounds = list((c_int * (N + 1)).from_address(cu_seqlens_cpu.data_ptr()))
+            host_seqs = tuple(itertools.pairwise(bounds))
+            host_tiles = _host_tiles(host_seqs, C, cu_seqlens.dtype, dev)
+            if chunk_indices is None:
+                chunk_indices = host_tiles[0]
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, C)
+        NT = 0
+        total_tiles = chunk_indices.shape[0]
+    else:
+        N = B
+        NT = triton.cdiv(T, C)
+        total_tiles = B * NT
+
+    if checkpoint_offsets is not None:
+        _check_checkpoints(
+            checkpoint_state, checkpoint_offsets, checkpoint_state_indices, N, H, V, K
+        )
+    if paged:
+        _check_paged_state_cache(
+            state_cache,
+            state_indices,
+            has_initial_state,
+            N=N,
+            H=H,
+            V=V,
+            K=K,
+        )
+
+    if host_tiles is not None:
+        seqs = host_seqs
+    elif cu_seqlens is not None:
+        seqs = _seq_bounds(cu_seqlens)
+    else:
+        seqs = tuple((b * T, b * T + T) for b in range(B))
+
+    # Longest sequence in chunks: segmentation is judged per sequence, and
+    # passing it as the segment length is what disables segmentation. Resolved
+    # here rather than next to _build_segments because K1 launches first and the
+    # cache modifiers below depend on the answer.
+    n_chunks_max = max(triton.cdiv(eos - bos, C) for bos, eos in seqs)
+    nchs = [triton.cdiv(eos - bos, C) for bos, eos in seqs]
+    if chunks_per_seg is None:
+        split = gluon_pipeline or (use_gluon_k2 and DEVICE_ARCH == "gfx1250")
+        chunks_per_seg = _choose_chunks_per_seg(
+            n_chunks_max, N, H, V, nchs if split else None, split
+        )
+    elif chunks_per_seg <= 0:
+        chunks_per_seg = n_chunks_max
+    segmented = n_chunks_max > chunks_per_seg
+    plan = _published_gluon_schedule("flash_kda_gluon_plan")
+    if gluon_pipeline and segmented and n_chunks_max >= plan.kwargs["TAPER_MIN_CHUNKS"]:
+        chunks_per_seg = min(
+            max(chunks_per_seg, plan.kwargs["TAPER_SEG_CHUNKS"]), n_chunks_max
+        )
+    seg_lens = _seg_plan(seqs, C, chunks_per_seg, H, gluon_pipeline and segmented)
+
+    CM_LOAD = "" if gluon_pipeline else ".cg"
+    CM_STORE = "" if segmented or gluon_pipeline else ".wt"
+    CM_OUT_STORE = "" if segmented else ".cs"
+
+    ws_shape = (H * total_tiles, C, K)
+    alloc = _workspace if gluon_pipeline else None
+
+    def scratch(name, shape, dtype):
+        if alloc is None:
+            return torch.empty(shape, dtype=dtype, device=dev)
+        return alloc(name, tuple(shape), dtype, dev)
+
+    ws_kd = scratch("kd", ws_shape, torch.bfloat16)
+    ws_qd = scratch("qd", ws_shape, torch.bfloat16)
+    ws_kr = scratch("kr", ws_shape, torch.bfloat16)
+    ws_gt = scratch("gt", (H * total_tiles, K), torch.float32)
+    # fp16 rather than bf16, for the mantissa and not the range: the inverse the
+    # prepare kernel writes here is bounded by 1, and K2 walks it through a
+    # recurrence as long as the sequence, so the 8 mantissa bits of bf16 are what
+    # ends up limiting the fused path. On correlated keys with a weak gate, bf16
+    # here scores 1.1e-2 against an fp32 recurrence where fp16 scores 2.3e-3,
+    # which is the difference between losing to the default pipeline and beating
+    # it by 5x. Both are two bytes, and fp32 would cost 1.3-1.5x, since this is
+    # read twice per chunk on K2's serial path. The CUTLASS FlashKDA picks fp16
+    # here for the same reason.
+    ws_inv_mqk = scratch("inv", (H * total_tiles, 2 * C, C), torch.float16)
+
+    # Only a segmented shape has a pass A. On gfx950, pass C's route is final
+    # here when unsegmented; segmented, it is settled once the segment count is
+    # known.
+    use_gluon_k2a = use_gluon_k2 and segmented
+    use_gluon_k2c = gluon_pipeline or (use_gluon_k2 and DEVICE_ARCH == "gfx1250")
+    ws_beta = None
+
+    if use_gluon_k1:
+        if DEVICE_ARCH == "gfx1250":
+            from aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn.flash_kda_k1 import (
+                gluon_k1_prepare,
+            )
+
+            k1_warps, k1_waves = _k1_gluon_schedule()
+            k1_args = {
+                "stride_q": stride_q,
+                "stride_k": stride_k,
+                "stride_g": stride_g,
+                "num_warps": k1_warps,
+                "waves_per_eu": k1_waves,
+            }
+        else:
+            from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.flash_kda_k1 import (
+                gluon_k1_prepare,
+            )
+
+            k1_sched = _published_gluon_schedule("k1_prepare_gluon")
+            k1_args = {
+                "num_warps": k1_sched.num_warps,
+                "waves_per_eu": k1_sched.kwargs.get("waves_per_eu", 0),
+                "epoch": _call_epoch(dev) if gluon_pipeline else None,
+                "stride_beta": stride_beta,
+            }
+
+        gluon_k1_prepare(
+            q=q,
+            k=k,
+            g_raw=g,
+            beta_raw=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ws_kd=ws_kd,
+            ws_qd=ws_qd,
+            ws_kr=ws_kr,
+            ws_gt=ws_gt,
+            ws_inv_mqk=ws_inv_mqk,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=(
+                chunk_indices
+                if cu_seqlens is None or not gluon_pipeline
+                else (
+                    host_tiles[1]
+                    if host_tiles is not None
+                    else _tile_table(cu_seqlens, chunk_indices, C)
+                )
+            ),
+            scale=scale,
+            lower_bound=lower_bound,
+            T=T,
+            NT=NT,
+            TOTAL_TILES=total_tiles,
+            H=H,
+            K=K,
+            C=C,
+            BC=inv_block,
+            B=B,
+            CM_WS=CM_STORE,
+            CM_LOAD=CM_LOAD,
+            **k1_args,
+        )
+    else:
+        _prepare_fast[(total_tiles if cu_seqlens is not None else NT, B * H)](
+            q=q,
+            k=k,
+            g_raw=g,
+            beta_raw=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ws_kd=ws_kd,
+            ws_qd=ws_qd,
+            ws_kr=ws_kr,
+            ws_gt=ws_gt,
+            ws_inv_mqk=ws_inv_mqk,
+            ws_beta=ws_beta,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            lower_bound=lower_bound,
+            T=T,
+            NT=NT,
+            TOTAL_TILES=total_tiles,
+            H=H,
+            K=K,
+            C=C,
+            BC=inv_block,
+            NUM_DOUBLING=inv_block.bit_length() - 2,
+            NUM_MERGE=(C // inv_block).bit_length() - 1,
+            CM_QKG=CM_LOAD,
+            CM_WS=CM_STORE,
+        )
+
+    desc, seq_seg_off, num_segs, max_segs = _build_segments(seqs, C, seg_lens, dev)
+    seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
+    ckpt_args = {}
+    if checkpoint_offsets is not None:
+        # All on the device: the kernel finds each snapshot's segment and chunk.
+        ckpt_args = {
+            "ckpt_state": checkpoint_state,
+            "ckpt_offsets": checkpoint_offsets,
+            "ckpt_rows": checkpoint_state_indices,
+            "ckpt_bos": (
+                cu_seqlens
+                if cu_seqlens is not None
+                else torch.arange(0, N * T, T, device=dev)
+            ),
+        }
+
+    # The kernel indexes h_in by segment, so normalize a V-first initial state
+    # once here instead of carrying the layout through three passes.
+    h0 = initial_state
+    if h0 is not None:
+        if state_v_first:
+            h0 = h0.transpose(-1, -2)
+        h0 = h0.contiguous()
+
+    o = (
+        out
+        if out is not None
+        else torch.empty_like(v, memory_format=torch.contiguous_format)
+    )
+    final_state = None
+    store_final = output_final_state or paged
+    if output_final_state and not paged:
+        shape = (N, H, V, K) if state_v_first else (N, H, K, V)
+        state_dtype = h0.dtype if h0 is not None else torch.float32
+        final_state = torch.empty(shape, dtype=state_dtype, device=dev)
+
+    cache_stride = int(state_cache.stride(0)) if paged else 0
+
+    common = {
+        "ws_kd": ws_kd,
+        "ws_qd": ws_qd,
+        "ws_kr": ws_kr,
+        "ws_gt": ws_gt,
+        "ws_inv_mqk": ws_inv_mqk,
+        "beta_raw": beta,
+        "seg_chunk_base": seg_chunk_base,
+        "seg_nchunks": seg_nchunks,
+        "seg_tok_base": seg_tok_base,
+        "seg_tok_end": seg_tok_end,
+        "seg_seq": seg_seq,
+        "seg_is_last": seg_is_last,
+        "TOTAL_TILES": total_tiles,
+        "NUM_SEGS_CLASS": _seg_occupancy_class(num_segs),
+        "H": H,
+        "K": K,
+        "V": V,
+        "C": C,
+        "STATE_V_FIRST": state_v_first,
+        "NUM_XCDS": get_num_xcds(),
+        "CM_OUT": CM_OUT_STORE,
+    }
+    paged_args = {
+        "state_cache": state_cache,
+        "state_indices": (
+            None
+            if not paged
+            else (
+                state_indices
+                if state_indices.dtype == torch.int32
+                else state_indices.to(torch.int32)
+            )
+        ),
+        "has_initial_state": has_initial_state,
+        "cache_stride": cache_stride,
+    }
+    unpaged_args = {
+        "state_cache": None,
+        "state_indices": None,
+        "has_initial_state": None,
+        "cache_stride": 0,
+    }
+
+    if use_gluon_k2a or use_gluon_k2c:
+        if DEVICE_ARCH == "gfx1250":
+            from aiter.ops.triton._gluon_kernels.gfx1250.kimi_delta_attn import (
+                flash_kda_k2 as _g2,
+            )
+        else:
+            from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
+                flash_kda_k2 as _g2,
+            )
+
+    def _launch_k2(*, W, **kw):
+        launch_args = {**common, **unpaged_args, **kw}
+        return _segment_fast[
+            lambda meta, _w=W: (triton.cdiv(_w, meta["BW"]), num_segs * H)
+        ](W=W, **launch_args)
+
+    if max_segs > 1:
+        # Pass A: b_seg (affine part) and A_seg (linear part), both fully
+        # parallel across segments. Neither writes outputs.
+        # The Gluon scan takes bf16 b and fp8 A.
+        b_ty = torch.bfloat16 if gluon_pipeline else torch.float32
+        A_ty = torch.float8_e4m3fn if gluon_pipeline else torch.bfloat16
+        b_seg = scratch("b_seg", (num_segs, H, K, V), b_ty)
+        A_seg = scratch("A_seg", (num_segs, H, K, K), A_ty)
+        if use_gluon_k2a and DEVICE_ARCH == "gfx1250":
+            seg_ids = _scanned_segs(seg_lens, dev)
+            sched = _k2_gluon_schedule(V, seg_ids.numel(), H)
+            _g2.gluon_k2_ab_fused(
+                ws_kd=ws_kd,
+                ws_kr=ws_kr,
+                ws_gt=ws_gt,
+                ws_inv_mqk=ws_inv_mqk,
+                v_input=v,
+                beta_raw=beta,
+                h_out_b=b_seg,
+                h_out_a=A_seg,
+                seg_ids=seg_ids,
+                seg_chunk_base=seg_chunk_base,
+                seg_nchunks=seg_nchunks,
+                seg_tok_base=seg_tok_base,
+                seg_tok_end=seg_tok_end,
+                TOTAL_TILES=total_tiles,
+                stride_v=stride_v,
+                H=H,
+                K=K,
+                V=V,
+                C=C,
+                BW=sched.kwargs["BW"],
+                CPL=sched.kwargs["CPL"],
+                num_warps=sched.num_warps,
+                waves_per_eu=sched.kwargs["waves_per_eu"],
+            )
+        elif use_gluon_k2a:
+            sched = _k2_gluon_schedule(V, num_segs, H)
+            _g2.gluon_k2_ab_fused(
+                ws_kd=ws_kd,
+                ws_kr=ws_kr,
+                ws_gt=ws_gt,
+                ws_inv_mqk=ws_inv_mqk,
+                v_input=v,
+                h_out_b=b_seg,
+                h_out_a=A_seg,
+                seg_rows=_pass_a_rows(
+                    seqs, C, seg_lens, H, V // sched.kwargs["BW"], dev
+                ),
+                TOTAL_TILES=total_tiles,
+                H=H,
+                K=K,
+                V=V,
+                C=C,
+                BW=sched.kwargs["BW"],
+                num_warps=sched.num_warps,
+                waves_per_eu=sched.kwargs.get("waves_per_eu", 0),
+            )
+        else:
+            for buf, width, identity, has_v in (
+                (b_seg, V, False, True),
+                (A_seg, K, True, False),
+            ):
+                _launch_k2(
+                    v_input=v,
+                    out=None,
+                    h_in=None,
+                    h_out=buf,
+                    final_state=None,
+                    W=width,
+                    INIT_IDENTITY=identity,
+                    HAS_H_IN=False,
+                    HAS_V=has_v,
+                    COMPUTE_OUTPUT=False,
+                    STORE_H_OUT=True,
+                    STORE_FINAL=False,
+                )
+
+    if max_segs > 1 and not gluon_pipeline:
+        # Pass B: propagate across segments (gfx950 Gluon runs it in pass C's launch).
+        h_in = torch.empty(num_segs, H, K, V, dtype=torch.float32, device=dev)
+        BV_SCAN, SCAN_WARPS = _scan_schedule(N, H, V)
+        scan = _seg_scan_prefetch_fast if _SCAN_PREFETCH else _seg_scan_fast
+        scan[(triton.cdiv(V, BV_SCAN), N * H)](
+            A_seg=A_seg,
+            b_seg=b_seg,
+            h_in=h_in,
+            h0=h0,
+            seq_seg_off=seq_seg_off,
+            H=H,
+            K=K,
+            V=V,
+            BV=BV_SCAN,
+            **paged_args,
+            num_warps=SCAN_WARPS,
+        )
+    elif max_segs <= 1:
+        h_in = None if paged else h0
+
+    # Pass C: re-run each segment from its true incoming state, writing outputs.
+    _log_route(
+        use_gluon_k1, use_gluon_k2a if segmented else None, use_gluon_k2c, C, K, V
+    )
+    if use_gluon_k2c:
+        if DEVICE_ARCH == "gfx1250":
+            sched = _k2_gluon_schedule(V, num_segs, H, "k2_c_gluon", wide=norm)
+            arch_args = {
+                "beta_raw": beta,
+                "stride_v": stride_v,
+                "CPL": sched.kwargs["CPL"],
+                "waves_per_eu": sched.kwargs["waves_per_eu"],
+            }
+            if norm:
+                arch_args.update(
+                    out_gate=out_gate, norm_weight=norm_weight, norm_eps=norm_eps
+                )
+        else:
+            sched = _k2c_gluon_schedule(segmented)
+            bw, nx, cus = sched.kwargs["BW"], get_num_xcds(), get_num_sms()
+            norm_args = {
+                "out_gate": out_gate,
+                "norm_weight": norm_weight,
+                "norm_eps": norm_eps,
+            }
+            arch_args = norm_args if norm else {}
+            # Copier-wave walk: both V halves of each stream must be resident at once.
+            per_xcd = 2 * triton.cdiv(num_segs * H, nx)
+            if (
+                norm
+                and paged
+                and not segmented
+                and checkpoint_offsets is None
+                and 2 * bw == V
+                and per_xcd <= cus // nx
+            ):
+                xb_n = H * total_tiles * 2 * C
+                arch_args["xbuf"], arch_args["xepoch"] = _epoch_buf(
+                    "cw", dev, xb_n, torch.int64
+                )
+            elif bw < V and (norm or triton.cdiv(V, bw) * num_segs * H > cus):
+                # Full V row per program: needed by the norm, or to fit one wave.
+                sched = triton.Config({"BW": V}, num_warps=sched.num_warps * V // bw)
+            if segmented:
+                # The scan in the same launch, in 16-column V slices.
+                nsegs = tuple(map(len, seg_lens))
+                bv = 16
+                tab, rmax, nscan = _scf_table(nsegs, H, V // bv, dev)
+                if nscan > plan.kwargs["SCAN_MAX_PROGS_PER_CU"] * cus:
+                    bv = 32
+                    tab, rmax, nscan = _scf_table(nsegs, H, V // bv, dev)
+                n_fl = rmax * (num_segs + N) * H * (V // bv) * sched.num_warps
+                sflags, ep = _epoch_buf("scf", dev, n_fl, torch.int32)
+                h_in = scratch("h_in", (rmax, num_segs, H, K, V), torch.bfloat16)
+                arch_args["scf"] = {
+                    "tab": tab,
+                    "RMAX": rmax,
+                    "A_seg": A_seg,
+                    "b_seg": b_seg,
+                    "h0": h0,
+                    "NH": N * H,
+                    "seq_seg_off": seq_seg_off,
+                    "sflags": sflags,
+                    "xepoch": ep,
+                    "BV": bv,
+                    "HSLAB": num_segs * H * K * V,
+                    "HAS_H0": paged or h0 is not None,
+                    "FSLAB": num_segs * H * (V // bv) * sched.num_warps,
+                }
+        _g2.gluon_k2_c(
+            ws_kd=ws_kd,
+            ws_qd=ws_qd,
+            ws_kr=ws_kr,
+            ws_gt=ws_gt,
+            ws_inv_mqk=ws_inv_mqk,
+            v_input=v,
+            out=o,
+            h_in=h_in,
+            final_state=final_state,
+            seg_chunk_base=seg_chunk_base,
+            seg_nchunks=seg_nchunks,
+            seg_tok_base=seg_tok_base,
+            seg_tok_end=seg_tok_end,
+            seg_seq=seg_seq,
+            seg_is_last=seg_is_last,
+            **(paged_args if paged else unpaged_args),
+            **ckpt_args,
+            TOTAL_TILES=total_tiles,
+            H=H,
+            K=K,
+            V=V,
+            C=C,
+            num_segs=num_segs,
+            BW=sched.kwargs["BW"],
+            **arch_args,
+            num_warps=sched.num_warps,
+            STORE_FINAL=store_final,
+            STATE_V_FIRST=state_v_first,
+            CM_OUT=CM_OUT_STORE,
+        )
+    else:
+        _launch_k2(
+            v_input=v,
+            out=o,
+            h_in=h_in,
+            h_out=None,
+            final_state=final_state,
+            W=V,
+            INIT_IDENTITY=False,
+            HAS_H_IN=h_in is not None or paged,
+            HAS_V=True,
+            COMPUTE_OUTPUT=True,
+            STORE_H_OUT=False,
+            STORE_FINAL=store_final,
+            **(paged_args if paged else {}),
+        )
+    if norm and not use_gluon_k2c:
+        o_f = o.float()
+        o_f = o_f * torch.rsqrt(o_f.square().mean(-1, keepdim=True) + norm_eps)
+        o.copy_(o_f * norm_weight * torch.sigmoid(out_gate.float()))
+
+    return o, final_state
